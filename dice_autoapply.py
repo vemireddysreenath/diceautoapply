@@ -5,6 +5,7 @@ from selenium.webdriver.support import expected_conditions as EC
 import time
 import os
 import json
+import re
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -19,6 +20,7 @@ with open("config.json", "r") as f:
 
 FILTERED_JOBS_URL = config.get("filtered_jobs_url")
 APPLY_LIMIT = config.get("apply_limit", 30)
+MAX_EXPERIENCE_YEARS = config.get("max_experience_years", 3)
 
 APPLIED_JOBS_FILE = "applied_jobs.txt"
 APPLIED_LOG_FILE = "applied_log.json"
@@ -63,6 +65,18 @@ def log_applied_job(job_url, job_title, company):
     with open(APPLIED_LOG_FILE, "w") as f:
         json.dump(logs, f, indent=2)
 
+def exceeds_experience_limit(text, max_years=MAX_EXPERIENCE_YEARS):
+    pattern = r'\b(?:at least|min(?:imum)?|over)?\s*(\d{1,2})\s*\+?\s*(?:years?|yrs?)\s*(?:of experience)?'
+    matches = re.findall(pattern, text, re.IGNORECASE)
+    for match in matches:
+        try:
+            years = int(match)
+            if years > max_years:
+                return True
+        except ValueError:
+            continue
+    return False
+
 # --- LOGIN ---
 def login():
     print("[*] Navigating to Dice login page...")
@@ -98,131 +112,127 @@ def login():
         print("[!] Login failed:", e)
         driver.quit()
 
-# --- OPEN JOB PAGES ---
-def open_all_job_pages_in_tabs(driver, FILTERED_JOBS_URL):
-    print("[*] Loading base search URL...")
-    driver.get(FILTERED_JOBS_URL)
+# --- APPLY TO JOBS PAGE BY PAGE ---
+def apply_jobs_on_page(applied_jobs, applied_count):
     wait = WebDriverWait(driver, 10)
+    buttons = driver.find_elements(By.XPATH, "//a[contains(@class, 'inline-flex') and @target='_blank']")
+    print(f"[→] Found {len(buttons)} job links on page")
 
-    try:
-        page_spans = wait.until(
-            EC.presence_of_all_elements_located((By.XPATH, "//span[contains(@class, 'font-bold') and text()[number()=number(.)]]"))
-        )
-        page_numbers = [int(span.text.strip()) for span in page_spans if span.text.strip().isdigit()]
-        total_pages = max(page_numbers) if page_numbers else 1
-        print(f"[+] Found total pages: {total_pages}")
-    except Exception:
-        print("[!] Could not determine page count. Defaulting to 1.")
-        total_pages = 1
+    for button in buttons:
+        if applied_count >= APPLY_LIMIT:
+            return applied_count
 
-    all_page_urls = [
-        FILTERED_JOBS_URL if i == 1 else f"{FILTERED_JOBS_URL}&page={i}"
-        for i in range(1, total_pages + 1)
-    ]
+        try:
+            label = button.text.strip()
+            url = button.get_attribute("href")
 
-    for url in all_page_urls:
-        print(f"[→] Opening: {url}")
-        driver.execute_script(f"window.open('{url}', '_blank');")
-        time.sleep(1)
+            if "Applied" in label or not url or "Easy Apply" not in label:
+                continue
+            if is_already_applied(url, applied_jobs):
+                continue
 
-    print("[✓] All pages opened.")
+            driver.execute_script("window.open(arguments[0]);", url)
+            driver.switch_to.window(driver.window_handles[-1])
+            time.sleep(4)
 
-# --- EASY APPLY FLOW ---
-def handle_easy_apply_flow():
-    print("[*] Starting Easy Apply flow...")
-    tabs = driver.window_handles
+            try:
+                title = driver.find_element(By.TAG_NAME, "h1").text.strip()
+                desc = driver.find_element(By.XPATH, "//div[contains(@class, 'job-description')]").text
+                combined = title + " " + desc
+                if exceeds_experience_limit(combined):
+                    print("    Skipped due to experience requirement")
+                    driver.close()
+                    driver.switch_to.window(driver.window_handles[0])
+                    continue
+            except:
+                pass
+
+            try:
+                job_title = driver.find_element(By.TAG_NAME, "h1").text.strip()
+            except:
+                job_title = "Unknown Title"
+
+            try:
+                company = driver.find_element(By.XPATH, "//span[contains(@class, 'company')]").text.strip()
+            except:
+                company = "Unknown Company"
+
+            try:
+                apply_btn = driver.find_element(By.XPATH, "//*[@id='applyButton']/apply-button-wc")
+                apply_btn.click()
+                print("    Clicked Easy Apply")
+                time.sleep(2)
+            except:
+                print("    Easy Apply not found")
+                driver.close()
+                driver.switch_to.window(driver.window_handles[0])
+                continue
+
+            try:
+                next_btn = driver.find_element(By.XPATH, "//span[text()='Next']")
+                next_btn.click()
+                time.sleep(2)
+            except:
+                pass
+
+            try:
+                submit_btn = driver.find_element(By.XPATH, "//span[text()='Submit']")
+                submit_btn.click()
+                print("    Submitted Application")
+                time.sleep(2)
+            except:
+                pass
+
+            mark_job_as_applied(url)
+            log_applied_job(url, job_title, company)
+            applied_jobs.add(url)
+            applied_count += 1
+            print(f"    Applied Count: {applied_count}/{APPLY_LIMIT}")
+
+            driver.close()
+            driver.switch_to.window(driver.window_handles[0])
+            time.sleep(1)
+
+        except Exception as e:
+            print(f"    Error: {e}")
+            driver.close()
+            driver.switch_to.window(driver.window_handles[0])
+
+    return applied_count
+
+def go_to_next_page_and_apply():
     applied_jobs = load_applied_jobs()
     applied_count = 0
 
-    for tab_index, tab in enumerate(tabs[1:], start=1):
-        print(f"[→] Processing tab {tab_index}/{len(tabs) - 1}")
-        driver.switch_to.window(tab)
-        time.sleep(2)
+    driver.get(FILTERED_JOBS_URL)
+    wait = WebDriverWait(driver, 10)
+    time.sleep(4)
 
-        buttons = driver.find_elements(By.XPATH, "//a[contains(@class, 'inline-flex') and @target='_blank']")
-        print(f"    Found {len(buttons)} job buttons")
+    while applied_count < APPLY_LIMIT:
+        applied_count = apply_jobs_on_page(applied_jobs, applied_count)
 
-        for button_index, button in enumerate(buttons, start=1):
-            try:
-                label = button.text.strip()
-                url = button.get_attribute("href")
+        try:
+            next_btn = WebDriverWait(driver, 10).until(
+                EC.presence_of_element_located((By.XPATH, "//span[@role='link' and @aria-label='Next']"))
+            )
+            if "cursor-not-allowed" in next_btn.get_attribute("class"):
+                print("[✓] Reached last page.")
+                break
 
-                if "Applied" in label or not url or "Easy Apply" not in label:
-                    continue
-                if is_already_applied(url, applied_jobs):
-                    print(f"    [→] Already applied (tracked): {url}")
-                    continue
+            # Force click using JavaScript
+            driver.execute_script("arguments[0].click();", next_btn)
+            print("[→] Clicked Next")
+            time.sleep(5)
 
-                print(f"    [✓] Opening job {button_index}: {url}")
-                driver.execute_script(f"window.open('{url}', '_blank');")
-                time.sleep(3)
+        except Exception as e:
+            print(f"[✓] Could not move to next page: {e}")
+            break
 
-                new_tab = driver.window_handles[-1]
-                driver.switch_to.window(new_tab)
-                time.sleep(5)
+    print("[✓] Finished job applications.")
 
-                try:
-                    title_elem = driver.find_element(By.TAG_NAME, "h1")
-                    job_title = title_elem.text.strip()
-                except:
-                    job_title = "Unknown Title"
 
-                try:
-                    company_elem = driver.find_element(By.XPATH, "//span[contains(@class, 'company')]")
-                    company_name = company_elem.text.strip()
-                except:
-                    company_name = "Unknown Company"
-
-                try:
-                    easy_apply_btn = driver.find_element(By.XPATH, "//*[@id='applyButton']/apply-button-wc")
-                    easy_apply_btn.click()
-                    print("        → Clicked Easy apply")
-                    time.sleep(2)
-                except:
-                    print("        → Easy apply button not found")
-                    driver.close()
-                    driver.switch_to.window(tab)
-                    continue
-
-                try:
-                    next_span = driver.find_element(By.XPATH, "//span[text()='Next']")
-                    next_span.click()
-                    print("        → Clicked Next")
-                    time.sleep(2)
-                except:
-                    print("        → No Next button")
-
-                try:
-                    submit_span = driver.find_element(By.XPATH, "//span[text()='Submit']")
-                    submit_span.click()
-                    print("        → Clicked Submit")
-                    time.sleep(2)
-                except:
-                    print("        → No Submit button")
-
-                mark_job_as_applied(url)
-                log_applied_job(url, job_title, company_name)
-                applied_jobs.add(url)
-                applied_count += 1
-                print(f"        → Applied count: {applied_count}/{APPLY_LIMIT}")
-
-                driver.close()
-                driver.switch_to.window(tab)
-                time.sleep(1)
-
-                if applied_count >= APPLY_LIMIT:
-                    print(f"[✓] Apply limit {APPLY_LIMIT} reached. Stopping.")
-                    return
-
-            except Exception as e:
-                print(f"    [!] Error processing job {button_index}: {e}")
-                driver.switch_to.window(tab)
-                continue
-
-    print("[✓] Completed Easy Apply flow.")
 
 # --- RUN APP ---
 login()
-open_all_job_pages_in_tabs(driver, FILTERED_JOBS_URL)
-handle_easy_apply_flow()
+go_to_next_page_and_apply()
 driver.quit()
